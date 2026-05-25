@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -207,7 +208,7 @@ class _SlashWorker:
             text=True,
             bufsize=1,
             cwd=os.getcwd(),
-            env=os.environ.copy(),
+            env={**os.environ, "_HERMES_FORCE_HERMES_TUI_SESSION_KEY": session_key},
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -307,6 +308,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
     _notify_session_boundary("on_session_finalize", session_id)
+
+    # Clean up per-session CC notify socket
+    if session_key:
+        _sock_path = f"/tmp/hermes-tui-{session_key}.sock"
+        try:
+            os.unlink(_sock_path)
+        except OSError:
+            pass
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -582,7 +591,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
 
             _wire_callbacks(sid)
+            current.setdefault("cc_queue", queue.Queue())
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+            _start_cc_notify_socket(key, current["cc_queue"])
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent)
@@ -2072,6 +2083,9 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         # Pin async event emissions to whichever transport created the
         # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
         "transport": current_transport() or _stdio_transport,
+        # Phase 3: per-session state for offline detection + CC routing
+        "last_interaction": time.time(),
+        "cc_queue": queue.Queue(),
     }
     try:
         _sessions[sid]["slash_worker"] = _SlashWorker(
@@ -2102,6 +2116,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         pass
     _wire_callbacks(sid)
     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+    _start_cc_notify_socket(key, _sessions[sid]["cc_queue"])
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent))
 
@@ -3154,6 +3169,9 @@ def _(rid, params: dict) -> dict:
 
     _start_agent_build(sid, session)
 
+    # Track last user interaction for offline detection
+    session["last_interaction"] = time.time()
+
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
         if err:
@@ -3175,28 +3193,412 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+# ── Full-chain debug logging ─────────────────────────────────────────
+# Auto-expires 7 days after gateway start.
+_DEBUG_EXPIRE_TS = time.time() + 7 * 86400
+
+def _write_debug_log(**data) -> None:
+    """Write a JSONL entry to the per-day debug log. No-op after expiry."""
+    if time.time() >= _DEBUG_EXPIRE_TS:
+        return
+    try:
+        _date = datetime.now().strftime("%Y%m%d")
+        _path = f"/opt/hermes/logs/cc-debug-{_date}.log"
+        _entry = {"ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+        _entry.update(data)
+        with open(_path, "a") as _f:
+            _f.write(json.dumps(_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# ── Offline detection config ───────────────────────────────────────────
+
+def _load_offline_threshold_minutes() -> float:
+    """Offline threshold in minutes before pushing to WeCom. Default 5."""
+    try:
+        return float(os.environ.get("HERMES_TUI_OFFLINE_THRESHOLD_M", "5"))
+    except (ValueError, TypeError):
+        return 5.0
+
+
+def _resolve_wecom_user(session: dict) -> str:
+    """Resolve the WeCom user ID for offline notification.
+
+    Checks: env var, config.yaml, then falls back to empty string.
+    """
+    env_user = os.environ.get("HERMES_TUI_WECOM_USER", "").strip()
+    if env_user:
+        return env_user
+    try:
+        cfg = _load_cfg()
+        tui_cfg = cfg.get("tui") if isinstance(cfg.get("tui"), dict) else {}
+        user = tui_cfg.get("wecom_user", "") or ""
+        if isinstance(user, str) and user.strip():
+            return user.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _direct_send(target: str, text: str) -> bool:
+    """Send a message directly via send_message_tool, no subprocess overhead.
+
+    Replaces subprocess.run(['hermes', 'send', '--to', target, text, '--quiet'])
+    to avoid fork+exec + Python interpreter restart for every reply (~500ms
+    savings per call on a warm system).
+    """
+    try:
+        from tools.send_message_tool import send_message_tool
+        import json
+
+        result = send_message_tool({
+            "action": "send",
+            "target": target,
+            "message": text,
+        })
+        payload = json.loads(result) if result else {}
+        return not payload.get("error")
+    except Exception:
+        return False
+
+
+def _push_wecom_notification(sid: str, session: dict, task_id: str, result: str, output_summary: str) -> bool:
+    """Push a CC task completion notification to WeCom and record pending.
+
+    Returns True if the push was successful.
+    """
+    wecom_user = _resolve_wecom_user(session)
+    if not wecom_user:
+        return False
+
+    try:
+        from gateway.run import _gateway_runner_ref
+        from gateway.config import Platform
+    except Exception:
+        return False
+
+    runner = _gateway_runner_ref()
+    if runner is None:
+        msg = (
+            f"**[CC]** `{task_id}` — {result}\n"
+            f"> `{sid}`\n"
+        )
+        if output_summary:
+            msg += f"> {output_summary[:120]}\n"
+        return _direct_send(f"wecom:{wecom_user}", msg)
+
+    adapter = runner.adapters.get(Platform.WECOM)
+    if adapter is None:
+        return False
+
+    session_key = session.get("session_key", sid)
+    session_name = _resolve_session_name(session_key)
+
+    text = (
+        f"**[CC]** `{task_id}` — {result}\n"
+        f"> `{session_key}`\n"
+    )
+    if output_summary:
+        text += f"> {output_summary[:120]}\n"
+    text += f"\n回复以继续对话。"
+
+    try:
+        import asyncio
+
+        async def _send():
+            r = await adapter.send(chat_id=wecom_user, content=text)
+            return r
+
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            import concurrent.futures
+            future = concurrent.futures.Future()
+
+            def _run():
+                try:
+                    l = asyncio.new_event_loop()
+                    asyncio.set_event_loop(l)
+                    result = l.run_until_complete(_send())
+                    future.set_result(result)
+                except Exception as e:
+                    future.set_exception(e)
+
+            threading.Thread(target=_run, daemon=True).start()
+            send_result = future.result(timeout=15)
+        else:
+            send_result = loop.run_until_complete(_send())
+
+        if send_result.success:
+            from gateway.pending_notifications import record
+            record(wecom_user, session_key, session_name)
+            _write_debug_log(event="wecom_push_done", session_key=session_key,
+                             task_id=task_id, result=result, success=True)
+            return True
+    except Exception:
+        pass
+
+    _write_debug_log(event="wecom_push_done", session_key=session.get("session_key", sid),
+                     task_id=task_id, result=result, success=False)
+    return False
+
+
+# [COMMENTED-OUT 2026-05-25] WeCom→TUI idle summary push removed.
+# Reason: Dead code — nothing calls this function after the call site
+#   in _notification_poller_loop was removed.
+# Function: Pushes a session idle summary to WeCom when user is offline too long.
+#   Sends session key, name, idle time, and recent message excerpts.
+# Restore: uncomment this function and restore the call site in _notification_poller_loop.
+# def _push_wecom_idle_summary(sid: str, session: dict) -> bool:
+#     """Push a session idle summary to WeCom when user is offline too long."""
+#     wecom_user = _resolve_wecom_user(session)
+#     if not wecom_user:
+#         return False
+#     try:
+#         from gateway.run import _gateway_runner_ref
+#         from gateway.config import Platform
+#     except Exception:
+#         return False
+#
+#     runner = _gateway_runner_ref()
+#     session_key = session.get("session_key", sid)
+#     session_name = _resolve_session_name(session_key)
+#     last_active = session.get("last_interaction", 0)
+#     idle_secs = int(time.time() - last_active) if last_active else 0
+#
+#     _idle_m = idle_secs // 60
+#     _idle_s = idle_secs % 60
+#     _name_line = f"> 会话: {session_name}\n" if session_name else ""
+#     text = (
+#         f"**[空闲]** `{session_key}`\n"
+#         f"{_name_line}"
+#         f"> 空闲: {_idle_m}分{_idle_s}秒\n"
+#     )
+#     # 尝试获取最后几条消息摘要
+#     try:
+#         db = _get_db()
+#         if db:
+#             rows = db.execute(
+#                 "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 3",
+#                 [session_key],
+#             ).fetchall()
+#             if rows:
+#                 last_msgs = []
+#                 for r in reversed(rows):
+#                     role, content = r
+#                     last_msgs.append(f"{role}: {content[:60].strip()}")
+#                 text += "> 最近: " + " | ".join(last_msgs[:2]) + "\n"
+#     except Exception:
+#         pass
+#     text += f"\n回复以继续对话。"
+#
+#     # Try direct adapter path first (same process)
+#     if runner is not None:
+#         adapter = runner.adapters.get(Platform.WECOM)
+#         if adapter is not None:
+#             try:
+#                 import asyncio
+#
+#                 async def _send():
+#                     r = await adapter.send(chat_id=wecom_user, content=text)
+#                     return r
+#
+#                 loop = None
+#                 try:
+#                     loop = asyncio.get_running_loop()
+#                 except RuntimeError:
+#                     loop = asyncio.new_event_loop()
+#                     asyncio.set_event_loop(loop)
+#                 if loop.is_running():
+#                     send_result = asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=15)
+#                 else:
+#                     send_result = loop.run_until_complete(_send())
+#                 if send_result.success:
+#                     _write_debug_log(event="wecom_idle_push", session_key=session_key,
+#                                      success=True, method="adapter")
+#                     return True
+#             except Exception:
+#                 pass
+#
+#     # Fallback: direct send (same process, no subprocess overhead)
+#     if _direct_send(f"wecom:{wecom_user}", text):
+#         _write_debug_log(event="wecom_idle_push", session_key=session_key,
+#                          success=True, method="direct")
+#         return True
+#     else:
+#         _write_debug_log(event="wecom_idle_push", session_key=session_key,
+#                          success=False, method="direct")
+#         return False
+
+
+def _resolve_session_name(session_key: str) -> str:
+    """Get a human-readable session name from the DB."""
+    try:
+        db = _get_db()
+        if db:
+            title = db.get_session_title(session_key)
+            if title:
+                return title
+    except Exception:
+        pass
+    return ""
+
+
+def _is_user_offline(sid: str, session: dict) -> bool:
+    """Determine if the user is offline using 4-signal combination.
+
+    Offline = ALL of:
+      1. session not _finalized
+      2. session still in _sessions
+      3. last_interaction exceeds threshold (default 300s)
+      4. session["running"] is False (agent idle)
+
+    Any single condition false → online.
+    """
+    if session.get("_finalized"):
+        return False
+    if _sessions.get(sid) is not session:
+        return False
+    _threshold_s = _load_offline_threshold_minutes() * 60
+    _last = session.get("last_interaction", 0)
+    if _last == 0:
+        return False   # 从未有用户交互，不算离线
+    if (time.time() - _last) < _threshold_s:
+        return False
+    if session.get("running"):
+        return False
+    return True
+
+
 def _notification_poller_loop(
-    stop_event: threading.Event, sid: str, session: dict
+    stop_event: threading.Event, sid: str, session: dict, cc_queue: queue.Queue | None = None
 ) -> None:
-    """Poll completion_queue and dispatch notifications autonomously.
+    """Poll per-session cc_queue + global completion_queue and dispatch notifications.
 
-    Runs in a daemon thread started by _init_session(). Emits a
-    status.update (kind=process) for user visibility, then chains an
+    Runs in a daemon thread started by _init_session(). CC task completion
+    events arrive via the per-session Unix socket → cc_queue (no source
+    routing needed). Other completion events arrive via the global queue.
+
+    Emits status.update (kind=process) for user visibility, then chains an
     agent turn via _run_prompt_submit if the session is idle.
-
-    NOTE: The completion_queue is global (one per process). If multiple
-    TUI sessions coexist, whichever poller wakes first grabs the event,
-    even if the process was started by a different session. This matches
-    CLI/gateway behavior (single session per process).
     """
     from tools.process_registry import process_registry, format_process_notification
 
-    while not stop_event.is_set() and not session.get("_finalized"):
-        try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
-        except Exception:
-            continue
+    _last_expire = time.time()
+    session["_last_idle_check"] = time.time()
 
+    while not stop_event.is_set() and not session.get("_finalized"):
+        evt = None
+
+        # 1) Check per-session CC queue first (non-blocking)
+        if cc_queue is not None:
+            try:
+                evt = cc_queue.get_nowait()
+            except Exception:
+                evt = None
+
+        # 2) Fall back to global completion_queue (blocking with timeout)
+        if evt is None:
+            try:
+                evt = process_registry.completion_queue.get(timeout=0.5)
+            except Exception:
+                # Periodic housekeeping
+                if time.time() - _last_expire >= 60:
+                    try:
+                        from gateway.pending_notifications import expire
+                        expire()
+                    except Exception:
+                        pass
+                    _last_expire = time.time()
+
+                # [COMMENTED-OUT 2026-05-25] WeCom→TUI idle summary push removed.
+                # Reason: WeCom→TUI routing is being removed; pushing idle session
+                #   summaries to WeCom no longer makes sense.
+                # Function: Periodically checks if user is offline, and if so, pushes
+                #   a session summary to WeCom. Controlled by HERMES_TUI_OFFLINE_THRESHOLD_M.
+                # Restore: uncomment this block. _push_wecom_idle_summary function
+                #   (line ~3229) must also be uncommented.
+                # Periodic idle-check: detect user gone offline and push session summary
+                # _idle_check_interval = max(15.0, _load_offline_threshold_minutes() * 60 / 2)
+                # _now = time.time()
+                # if _now - session.get("_last_idle_check", 0) >= _idle_check_interval:
+                #     session["_last_idle_check"] = _now
+                #     if _is_user_offline(sid, session) and not session.get("_offline_pushed"):
+                #         _pushed = _push_wecom_idle_summary(sid, session)
+                #         if _pushed:
+                #             session["_offline_pushed"] = True
+                #             _emit("status.update", sid, {
+                #                 "kind": "process",
+                #                 "text": "WeCom: session summary pushed (idle offline)",
+                #             })
+                # elif not _is_user_offline(sid, session):
+                #     session["_offline_pushed"] = False
+                continue
+
+        # --- CC task completion (from per-session queue) ---
+        if evt.get("type") == "cc_task_complete":
+            _src = evt.get("source", "")
+            _task_id = evt.get("task_id", "?")
+            _result = evt.get("result") or evt.get("status", "?")
+            _output = evt.get("output", evt.get("detail", {}).get("output_summary", ""))
+
+            _write_debug_log(event="poller_cc_done", session_key=sid,
+                             task_id=_task_id, result=_result, source=_src)
+
+            _offline = _is_user_offline(sid, session)
+            _write_debug_log(event="poller_offline_check", session_key=sid,
+                             task_id=_task_id, offline=_offline,
+                             last_interaction=session.get("last_interaction", 0),
+                             running=session.get("running"))
+
+            # ALWAYS emit TUI status — no offline gate
+            _text = format_process_notification(evt)
+            if _text:
+                _emit("status.update", sid, {"kind": "process", "text": _text})
+
+            # Offline: additional WeCom push (parallel, not instead of direct delivery)
+            if _offline:
+                if os.environ.get("HERMES_TUI_PUSH_ALL_CC", "").lower() in ("1", "true"):
+                    _pushed = _push_wecom_notification(
+                        sid, session, _task_id, _result, _output
+                    )
+                    if _pushed:
+                        _emit("status.update", sid, {
+                            "kind": "process",
+                            "text": f"WeCom: CC task {_task_id} {_result} (offline)",
+                        })
+
+            # Bridge file for non-TUI sources (fallback when WeCom push unavailable)
+            if _src and not _src.startswith("tui:"):
+                _bridge_line = json.dumps({
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "source": _src,
+                    "task_id": _task_id,
+                    "result": _result,
+                    "output": str(_output)[:500],
+                })
+                try:
+                    _bridge_file = os.path.join(os.path.dirname(__file__), "..", "..", "logs", "cc-wecom-pending.jsonl")
+                    _bridge_file = os.path.abspath(_bridge_file)
+                    os.makedirs(os.path.dirname(_bridge_file), exist_ok=True)
+                    with open(_bridge_file, "a") as _f:
+                        _f.write(_bridge_line + "\n")
+                except Exception:
+                    pass
+
+            # Save WeCom chat_id so the agent turn can route its response back
+            if evt.get("source") == "wecom":
+                _wecom_reply_chat_id = evt.get("wecom_chat_id", "") or evt.get("chat_id", "")
+                if _wecom_reply_chat_id:
+                    session["_wecom_reply_chat_id"] = _wecom_reply_chat_id
+
+        # --- Regular completion event (from global queue) ---
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
@@ -3209,11 +3611,18 @@ def _notification_poller_loop(
 
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                # Re-queue — wait for agent to become idle
+                if cc_queue is not None:
+                    cc_queue.put(evt)
+                else:
+                    process_registry.completion_queue.put(evt)
                 continue
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
+        _write_debug_log(event="poller_turn_start", session_key=sid,
+                         running=session.get("running"),
+                         text_preview=str(text)[:200])
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
@@ -3226,8 +3635,20 @@ def _notification_poller_loop(
             with session["history_lock"]:
                 session["running"] = False
 
-    # Drain any remaining events after stop signal (process all pending
-    # before exiting so nothing is lost on shutdown).
+    # Drain remaining events after stop signal.
+    # Drain per-session CC queue first.
+    if cc_queue is not None:
+        while not cc_queue.empty():
+            try:
+                evt = cc_queue.get_nowait()
+            except Exception:
+                break
+            if evt.get("type") == "cc_task_complete":
+                _text = format_process_notification(evt)
+                if _text:
+                    _emit("status.update", sid, {"kind": "process", "text": _text})
+
+    # Drain global completion queue.
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -3249,6 +3670,9 @@ def _notification_poller_loop(
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
+        _write_debug_log(event="poller_turn_start", session_key=sid,
+                         running=session.get("running"),
+                         text_preview=str(text)[:200])
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
@@ -3265,13 +3689,156 @@ def _notification_poller_loop(
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     stop = threading.Event()
+    cc_queue = session.get("cc_queue")
     t = threading.Thread(
         target=_notification_poller_loop,
-        args=(stop, sid, session),
+        args=(stop, sid, session, cc_queue),
         daemon=True,
     )
     t.start()
     return stop
+
+
+
+
+def _start_cc_notify_socket(session_key: str, cc_queue: queue.Queue) -> None:
+    """Per-session Unix domain socket listener for CC task completion notifications.
+
+    Each TUI session gets its own socket at /tmp/hermes-tui-{session_key}.sock
+    so CC completion notifications are delivered to the correct session without
+    source-routing re-queue.
+
+    Runs as a daemon thread. External processes (e.g. cc-dev completion
+    scripts) connect, send a one-line JSON message, and disconnect.
+    Parsed events are pushed into the per-session cc_queue.
+    """
+    sock_path = f"/tmp/hermes-tui-{session_key}.sock"
+
+    def _listen() -> None:
+        # Clean up stale socket file
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(sock_path)
+            sock.listen(5)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] cc notify socket bind failed for {sock_path}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return
+
+        print(
+            f"[tui_gateway] cc notify socket listening on {sock_path}",
+            file=sys.stderr,
+        )
+
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except Exception:
+                break
+
+            try:
+                with conn:
+                    data = conn.recv(4096)
+                    if not data:
+                        continue
+                    try:
+                        msg = json.loads(data.decode("utf-8").strip())
+                    except json.JSONDecodeError as exc:
+                        print(
+                            f"[tui_gateway] cc notify socket bad JSON: {exc}",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    if msg.get("type") == "wecom_message":
+                        # 复用 cc_task_complete 通路让 poller 走 re-queue
+                        msg["type"] = "cc_task_complete"
+                        msg["task_id"] = f"wecom-{msg.get('user','?')}-{int(msg.get('ts', time.time()))}"
+                        msg["status"] = "done"
+                        msg["source"] = "wecom"
+                        msg["summary"] = msg.get("text", "")[:200]
+                        msg["wecom_user"] = msg.get("user", "")
+                        msg["wecom_chat_id"] = msg.get("chat_id", "")
+
+                    if msg.get("type") != "cc_task_complete":
+                        print(
+                            f"[tui_gateway] cc notify socket unknown type: "
+                            f"{msg.get('type', '?')}",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    cc_queue.put(msg)
+                    # After successful processing, send ack back to CC
+                    try:
+                        conn.sendall(b'{"status":"ack"}\n')
+                    except Exception:
+                        pass  # Best-effort; CC notification was already received
+                    print(
+                        f"[tui_gateway] cc notify socket queued task "
+                        f"{msg.get('task_id', '?')} → {sock_path}",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(
+                    f"[tui_gateway] cc notify socket recv error: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
+    t = threading.Thread(target=_listen, daemon=True)
+    t.start()
+
+
+def find_session_by_key(session_key: str) -> dict | None:
+    """Find a TUI session by its session_key.
+
+    Used by WeCom inbound routing to inject messages into the correct
+    TUI session when a user replies to an offline notification.
+    """
+    for session in list(_sessions.values()):
+        if isinstance(session, dict) and session.get("session_key") == session_key:
+            return session
+    return None
+
+
+def steer_session(session_key: str, text: str) -> bool:
+    """Inject a message into a TUI session via agent.steer().
+
+    Used by WeCom inbound routing. Returns True if the message was
+    successfully queued for the agent.
+
+    Safe to call from any thread — agent.steer() is designed to be
+    called while the agent is running (text is injected into the next
+    tool result).
+    """
+    _write_debug_log(event="tui_steer_received", session_key=session_key,
+                     text_preview=text[:100])
+    session = find_session_by_key(session_key)
+    if not session:
+        _write_debug_log(event="tui_steer_fail", reason="session_not_found",
+                         session_key=session_key)
+        return False
+    agent = session.get("agent")
+    if agent is None or not hasattr(agent, "steer"):
+        return False
+    try:
+        accepted = agent.steer(text)
+        _write_debug_log(event="tui_steer_injected", session_key=session_key,
+                         running=session.get("running"))
+        _write_debug_log(event="wecom_reply_received", session_key=session_key,
+                         accepted=accepted, text_preview=text[:80])
+        return bool(accepted)
+    except Exception:
+        return False
 
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
@@ -3608,6 +4175,26 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+
+            # ── WeCom reply-back (inside finally) ────────────────────
+            # Pop chat_id here so it is captured even if an exception
+            # propagates after cleanup.
+            _wecom_chat_id = session.pop("_wecom_reply_chat_id", None)
+            if _wecom_chat_id:
+                try:
+                    with session["history_lock"]:
+                        _last_msg = ""
+                        for _m in reversed(session.get("history", [])):
+                            if _m.get("role") == "assistant" and _m.get("content"):
+                                _last_msg = _m["content"]
+                                break
+                    if _last_msg:
+                        subprocess.run(
+                            ["hermes", "send", "--to", f"wecom:{_wecom_chat_id}", _last_msg[:2000]],
+                            timeout=10,
+                        )
+                except Exception:
+                    pass  # Best-effort: don't break the TUI turn
 
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the

@@ -75,3 +75,21 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# ── Local deployment artifacts ──────────────────
+*.bak
+*.bak-*
+*.bak.*
+cron/reports/
+cron-output.txt
+daily_report.txt
+article-publish-monitor-report.md
+DASHBOARD.json
+.workbuddy_article_publish_report.md
+jobs/
+monitor_report.md
+monitor_report.txt
+outputs/
+reports/
+runtime/
+smart_monitor_status.md
+tmp_proc_check.sh

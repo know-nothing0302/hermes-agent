@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import socket
 import json
 import logging
 import mimetypes
@@ -58,6 +59,8 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+from tui_gateway.server import _write_debug_log
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
@@ -70,6 +73,13 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# [COMMENTED-OUT 2026-05-25] WeCom→TUI routing path removed.
+# Reason: 20 known issues (see /home/ubuntu/hermes-cc-cowork/analysis/20260525-wecom-routing-all-problems.md)
+# Function: Module-level state for multi-session selection and session binding.
+# Restore: uncomment these two lines, then uncomment blocks B-D below.
+# _multi_session_state: Dict[str, list] = {}
+# _wecom_session_binding: Dict[str, str] = {}  # wecom_user → session_key
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
 
@@ -91,7 +101,7 @@ MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
-RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+RECONNECT_BACKOFF = [2, 5, 15, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
 
@@ -335,10 +345,14 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if not self._running:
                     return
-                logger.warning("[%s] WebSocket error: %s", self.name, exc)
+                ts = time.time()
+                self._mark_disconnected()
+                logger.warning("[%s] WebSocket disconnected at %s", self.name, ts)
                 self._fail_pending_responses(RuntimeError("WeCom connection interrupted"))
 
                 delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+                attempt = backoff_idx + 1
+                logger.info("[%s] Reconnecting in %ds (attempt %d)...", self.name, delay, attempt)
                 backoff_idx += 1
                 await asyncio.sleep(delay)
 
@@ -346,9 +360,10 @@ class WeComAdapter(BasePlatformAdapter):
                     await self._open_connection()
                     backoff_idx = 0
                     self._mark_connected()
-                    logger.info("[%s] Reconnected", self.name)
+                    logger.info("[%s] WebSocket reconnected successfully at %s", self.name, time.time())
+                    _write_debug_log(event="wecom_ws_reconnect_verified", ts=time.time())
                 except Exception as reconnect_exc:
-                    logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
+                    logger.warning("[%s] Reconnect attempt %d failed: %s", self.name, attempt, reconnect_exc)
 
     async def _read_events(self) -> None:
         """Read websocket frames until the connection closes."""
@@ -357,6 +372,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         while self._running and self._ws and not self._ws.closed:
             msg = await self._ws.receive()
+
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
@@ -478,6 +494,262 @@ class WeComAdapter(BasePlatformAdapter):
         return payload if isinstance(payload, dict) else None
 
     # ------------------------------------------------------------------
+    # Pending notification routing
+    # ------------------------------------------------------------------
+
+    async def _route_if_pending(
+        self, sender_id: str, chat_id: str, text: str, payload: Dict[str, Any]
+    ) -> bool:
+        """Check pending notifications and route message if applicable.
+
+        Returns True if the message was consumed by routing (i.e. do not
+        continue to normal dispatch). Returns False for passthrough.
+        """
+        try:
+            from gateway.pending_notifications import (
+                record,
+                resolve,
+                resolve_numeric,
+                mark_replied,
+                mark_in_progress,
+                clear_pending,
+            )
+        except ImportError:
+            return False
+
+        # ── P1: Check for explicit "back to normal" command ──
+        _text = (text or "").strip()
+        if _text.lower() in ("wecom", "back"):
+            try:
+                clear_pending(sender_id)
+            except ImportError:
+                pass
+            await self.send(
+                chat_id=chat_id,
+                content="↩ Switched back to WeCom chat mode.",
+            )
+            return True
+
+        # Check for numeric reply to a multi-session ask
+        try:
+            _choice = int(_text)
+            if 1 <= _choice <= 99:
+                result = resolve_numeric(sender_id, _choice)
+                if result["action"] == "route":
+                    session_id = result["session_id"]
+                    try:
+                        from tui_gateway.server import steer_session
+                    except ImportError:
+                        await self.send(
+                            chat_id=chat_id,
+                            content="TUI session not available. Your message could not be delivered.",
+                        )
+                        mark_replied(sender_id, session_id)
+                        return True
+                    ok = steer_session(session_id, _text)
+                    _write_debug_log(event="wecom_steer_result", user=sender_id,
+                                     session_id=session_id, success=ok)
+                    if ok:
+                        mark_replied(sender_id, session_id)
+                        await self.send(
+                            chat_id=chat_id,
+                            content="Message delivered to TUI session.",
+                        )
+                    else:
+                        await self.send(
+                            chat_id=chat_id,
+                            content="TUI session not found. It may have ended or the notification expired (>30 min). Start a new TUI session or wait for the next notification.",
+                        )
+                        mark_replied(sender_id, session_id)
+                    return True
+        except (ValueError, TypeError):
+            pass
+
+        # [COMMENTED-OUT 2026-05-25] WeCom→TUI routing path removed.
+        # Reason: 20 known issues (see /home/ubuntu/hermes-cc-cowork/analysis/20260525-wecom-routing-all-problems.md)
+        # Function: Routes user messages to a pre-bound TUI session via raw Unix socket.
+        #   Replaces message text with a system notification (user's original text lost).
+        # Restore: uncomment this block and restore _wecom_session_binding module-level dict.
+        # ── P3: Check for existing session binding ──
+        # if sender_id in _wecom_session_binding:
+        #     chosen = _wecom_session_binding[sender_id]
+        #     # "wecom" / "back" 命令解绑
+        #     if _text.lower() in ("wecom", "back"):
+        #         del _wecom_session_binding[sender_id]
+        #         from gateway.pending_notifications import clear_pending
+        #         clear_pending(sender_id)
+        #         await self.send(chat_id=chat_id, content="↩ 已切回 WeCom 普通对话")
+        #         return True
+        #     # 直接路由到绑定 session（不发原始文本，只通知绑定事件）
+        #     _payload = json.dumps({
+        #         "type": "wecom_message",
+        #         "user": sender_id,
+        #         "chat_id": chat_id,
+        #         "text": f"[系统] 用户已选择 session {chosen[:20]}",
+        #         "ts": time.time()
+        #     })
+        #     try:
+        #         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        #         sock.settimeout(1)
+        #         sock.connect(f"/tmp/hermes-tui-{chosen}.sock")
+        #         sock.sendall(_payload.encode() + b"\n")
+        #         sock.close()
+        #     except Exception:
+        #         await self.send(chat_id=chat_id, content="Session 不可用，已解除绑定。请重新发送消息。")
+        #         del _wecom_session_binding[sender_id]
+        #     return True
+
+        # [COMMENTED-OUT 2026-05-25] WeCom→TUI routing path removed.
+        # Reason: 20 known issues (see /home/ubuntu/hermes-cc-cowork/analysis/20260525-wecom-routing-all-problems.md)
+        # Function: Handles user's numeric choice from multi-session listing (populated by block D).
+        #   Routes the message to the chosen session via nc subprocess, then binds future messages.
+        # Restore: uncomment this block and restore _multi_session_state/_wecom_session_binding dicts.
+        # ── P2: Multi-session selection (local dict, not pending_notifications) ──
+        # if sender_id in _multi_session_state:
+        #     _sessions = _multi_session_state[sender_id]
+        #     try:
+        #         _idx = int(_text) - 1
+        #         if 0 <= _idx < len(_sessions):
+        #             chosen = _sessions[_idx]
+        #             del _multi_session_state[sender_id]
+        #             _wecom_session_binding[sender_id] = chosen
+        #             _write_debug_log(event="wecom_multi_session_chosen", user=sender_id,
+        #                              session_key=chosen, choice=int(_text))
+        #             _payload = json.dumps({
+        #                 "type": "wecom_message",
+        #                 "user": sender_id,
+        #                 "chat_id": chat_id,
+        #                 "text": text,
+        #                 "ts": time.time()
+        #             })
+        #             import subprocess
+        #             try:
+        #                 subprocess.run(
+        #                     ["nc", "-U", f"/tmp/hermes-tui-{chosen}.sock"],
+        #                     input=_payload.encode() + b"\n",
+        #                     timeout=5
+        #                 )
+        #                 await self.send(chat_id=chat_id, content="✓ 消息已路由到选定 session")
+        #             except Exception:
+        #                 await self.send(chat_id=chat_id, content="Session 不可用，请重试")
+        #             return True
+        #         else:
+        #             _write_debug_log(event="wecom_multi_session_invalid_choice",
+        #                              user=sender_id, choice=int(_text), max=len(_sessions))
+        #             await self.send(chat_id=chat_id,
+        #                             content=f"无效选择，请输入 1-{len(_sessions)} 之间的数字")
+        #             return True
+        #     except (ValueError, TypeError):
+        #         pass
+
+        result = resolve(sender_id)
+        _write_debug_log(event="wecom_route_resolve", user=sender_id,
+                         action=result.get("action"),
+                         session_count=len(result.get("options", [])),
+                         session_id=result.get("session_id", ""))
+
+        # [COMMENTED-OUT 2026-05-25] WeCom→TUI routing path removed.
+        # Reason: 20 known issues (see /home/ubuntu/hermes-cc-cowork/analysis/20260525-wecom-routing-all-problems.md)
+        # Function: On passthrough, scans /tmp/hermes-tui-*.sock for live sessions.
+        #   Single session → auto-route; multiple → populate multi_session_state for user choice.
+        #   Previously internal return False for "no active session" is now handled
+        #   by the final return False at the end of _route_if_pending.
+        # Restore: uncomment this block and restore _multi_session_state/_wecom_session_binding dicts.
+        # if result["action"] == "passthrough":
+        #     # 无 pending notification，尝试路由到活跃 TUI session
+        #     import glob
+        #     sockets = glob.glob("/tmp/hermes-tui-*.sock")
+        #     active = []
+        #     for s in sockets:
+        #         sk = s.replace("/tmp/hermes-tui-", "").replace(".sock", "")
+        #         if len(sk) >= 20:  # 合法的 session_key 格式
+        #             active.append(sk)
+        #
+        #     if len(active) == 1:
+        #         # 单 session → 直接注入
+        #         try:
+        #             payload = json.dumps({
+        #                 "type": "wecom_message",
+        #                 "user": sender_id,
+        #                 "chat_id": chat_id,
+        #                 "text": text,
+        #                 "ts": time.time()
+        #             })
+        #             import subprocess
+        #             subprocess.run(
+        #                 ["nc", "-U", f"/tmp/hermes-tui-{active[0]}.sock"],
+        #                 input=payload.encode() + b"\n",
+        #                 timeout=5
+        #             )
+        #             await self.send(chat_id=chat_id, content="✓ 消息已路由到 TUI session")
+        #             return True
+        #         except Exception:
+        #             pass
+        #     elif len(active) > 1:
+        #         # 多 session → 列出编号让用户选
+        #         _multi_session_state[sender_id] = active
+        #         lines = [f"你有 **{len(active)}** 个活跃 TUI session：\n"]
+        #         for i, s in enumerate(active, 1):
+        #             lines.append(f"**{i}.** {s}")
+        #         lines.append("\n回复数字选择目标 session。")
+        #         await self.send(chat_id=chat_id, content="\n".join(lines))
+        #         return True
+        #
+        #     # 无活跃 TUI session → 走 Gateway agent
+        #     _write_debug_log(event="wecom_use_gateway_agent", user=sender_id,
+        #                      reason="no_pending_or_passthrough")
+        #     return False
+
+        if result["action"] == "route":
+            session_id = result["session_id"]
+            try:
+                from tui_gateway.server import steer_session
+            except ImportError:
+                await self.send(
+                    chat_id=chat_id,
+                    content="TUI session not available. Your message could not be delivered.",
+                )
+                mark_replied(sender_id, session_id)
+                return True
+
+            ok = steer_session(session_id, text)
+            _write_debug_log(event="wecom_steer_result", user=sender_id,
+                             session_id=session_id, success=ok)
+            if ok:
+                mark_replied(sender_id, session_id)
+                await self.send(
+                    chat_id=chat_id,
+                    content=f"Message delivered to TUI session.",
+                )
+            else:
+                await self.send(
+                    chat_id=chat_id,
+                    content="TUI session not found. It may have ended or the notification expired (>30 min). Start a new TUI session or wait for the next notification.",
+                )
+                mark_replied(sender_id, session_id)
+            return True
+
+        if result["action"] == "ask":
+            options = result.get("options", [])
+            now = time.time()
+            lines = [f"You have **{len(options)}** pending TUI sessions:\n"]
+            for i, opt in enumerate(options, 1):
+                name = opt.get("session_name") or opt.get("session_id", "?")
+                notified_at = opt.get("notified_at", 0)
+                if notified_at:
+                    minutes_ago = int((now - notified_at) / 60)
+                    lines.append(f"**{i}.** {name} _(~{minutes_ago} min ago)_")
+                else:
+                    lines.append(f"**{i}.** {name}")
+            lines.append("\nReply with the number to continue that session.")
+            await self.send(chat_id=chat_id, content="\n".join(lines))
+            for opt in options:
+                mark_in_progress(sender_id, opt["session_id"])
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # Inbound message parsing
     # ------------------------------------------------------------------
 
@@ -530,6 +802,20 @@ class WeComAdapter(BasePlatformAdapter):
         if not text and not media_urls:
             logger.debug("[%s] Empty WeCom message skipped", self.name)
             return
+
+        _write_debug_log(event="wecom_on_message", user=sender_id,
+                         text_preview=(text or "")[:100])
+
+        # ── Pending notification routing ────────────────────────────
+        # Before dispatching as a normal WeCom conversation, check if
+        # this user has pending TUI offline notifications.  Route the
+        # message to the correct TUI session when applicable.
+        if not is_group and text:
+            _routed = await self._route_if_pending(
+                sender_id, chat_id, text, payload
+            )
+            if _routed:
+                return
 
         source = self.build_source(
             chat_id=chat_id,
@@ -1384,6 +1670,9 @@ class WeComAdapter(BasePlatformAdapter):
         error = self._response_error(response)
         if error:
             return SendResult(success=False, error=error)
+
+        _write_debug_log(event="wecom_reply_sent", user=chat_id, chat_id=chat_id,
+                         text_preview=(content or "")[:100])
 
         return SendResult(
             success=True,

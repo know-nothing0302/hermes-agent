@@ -1469,6 +1469,24 @@ def format_process_notification(evt: dict) -> "str | None":
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
 
+    if evt.get("source") == "wecom":
+        return (
+            f"[WECOM] 用户 {evt.get('wecom_user','?')}: "
+            f"{evt.get('summary', evt.get('output', ''))}"
+        )
+
+    if evt_type == "cc_task_complete":
+        tid = evt.get("task_id", "?")
+        result = evt.get("result", "?")
+        output = evt.get("output", "")
+        src = evt.get("source", "unknown")
+        return (
+            f"[CC-NOTIFICATION] Task {tid} completed ({result}).\n"
+            f"Source: {src}\n"
+            f"Please review the CC output and decide next steps.\n"
+            f"Output:\n{output}"
+        )
+
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
 

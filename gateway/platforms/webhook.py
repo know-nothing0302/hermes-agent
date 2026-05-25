@@ -428,6 +428,53 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
+        # ── Message injection mode ───────────────────────────────
+        # When payload contains "inject_to", deliver text to an
+        # existing session instead of creating a new agent run.
+        inject_to = payload.get("inject_to")
+        if inject_to:
+            inject_platform = inject_to.get("platform", "")
+            inject_chat_id = inject_to.get("chat_id", "")
+            inject_text = payload.get("text", "")
+            inject_chat_type = inject_to.get("chat_type", "dm")
+            inject_user_id = inject_to.get("user_id", "")
+
+            if not inject_platform or not inject_chat_id:
+                return web.json_response(
+                    {"error": "inject_to requires platform and chat_id"},
+                    status=400,
+                )
+
+            if not self.gateway_runner:
+                return web.json_response(
+                    {"error": "No gateway runner available"},
+                    status=503,
+                )
+
+            success = await self.gateway_runner.inject_session_message(
+                platform=inject_platform,
+                chat_id=inject_chat_id,
+                text=inject_text,
+                chat_type=inject_chat_type,
+                user_id=inject_user_id,
+                internal=True,
+            )
+
+            if success:
+                logger.info(
+                    "[webhook] Injected message to %s/%s len=%d",
+                    inject_platform, inject_chat_id, len(inject_text),
+                )
+                return web.json_response(
+                    {"status": "injected", "platform": inject_platform},
+                    status=200,
+                )
+            else:
+                return web.json_response(
+                    {"error": f"Platform {inject_platform} not connected"},
+                    status=503,
+                )
+
         # Check event type filter
         event_type = (
             request.headers.get("X-GitHub-Event", "")

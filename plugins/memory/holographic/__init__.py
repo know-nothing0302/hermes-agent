@@ -358,13 +358,27 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def _auto_extract_facts(self, messages: list) -> None:
         _PREF_PATTERNS = [
+            # English
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+            # Chinese — preference declarations
+            re.compile(r'我(?:喜欢|偏好|习惯|总是|从不|一直|通常|一般|经常)(.+)'),
+            re.compile(r'我的(?:首选|默认|常用|偏好)(?:\w+)?(?:是|为)(.+)'),
+            re.compile(r'我不(?:喜欢|需要|想要|习惯|擅长)(.+)'),
+            re.compile(r'我更(?:喜欢|倾向于|习惯|愿意)(.+)'),
+            re.compile(r'我觉?得?(?:还是|应该|必须|可以)(.+)'),
         ]
         _DECISION_PATTERNS = [
+            # English
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            # Chinese — decision / project declarations
+            re.compile(r'我们(?:决定|商定|同意|确定|选择|达成|敲定|最终)(.+)'),
+            re.compile(r'(?:已经|已)(?:决定|确定|选定|采购|部署|上线|完成)(.+)'),
+            re.compile(r'项目(?:使用|需要|要求|采用|部署在|基于)(.+)'),
+            re.compile(r'最终(?:选择|采用|决定|方案|确定)(.+)'),
+            re.compile(r'(?:方案|架构|技术选型)(?:是|为|确定|采用)(.+)'),
         ]
 
         extracted = 0

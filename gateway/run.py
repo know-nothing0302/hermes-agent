@@ -2531,6 +2531,80 @@ class GatewayRunner:
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
 
+    # -------- cross-platform message injection -------------------------
+    # Public API for pushing a message into an existing session from
+    # outside the normal adapter flow (e.g. webhook, cron, monitoring).
+    # Uses _enqueue_fifo → _pending_messages → drain-pending recursion
+    # so the message is consumed within the same session, either
+    # immediately (if the session is active) or on the next user input.
+
+    async def inject_session_message(
+        self,
+        platform: str,
+        chat_id: str,
+        text: str,
+        chat_type: str = "dm",
+        user_id: str = "",
+        internal: bool = True,
+    ) -> bool:
+        """Inject a message into an existing session.
+
+        If the session is active, the drain-pending recursion picks it up
+        automatically.  If the session is idle, the message queues in
+        ``adapter._pending_messages`` and is delivered on the next user
+        input (or the next drain cycle).
+
+        Returns ``True`` if the message was enqueued, ``False`` if the
+        target platform is not connected.
+        """
+        try:
+            target_platform = Platform(platform)
+        except ValueError:
+            logger.warning(
+                "[inject] Unknown platform: %s", platform
+            )
+            return False
+
+        adapter = self.adapters.get(target_platform)
+        if adapter is None:
+            logger.warning(
+                "[inject] Platform %s not connected", platform
+            )
+            return False
+
+        source = SessionSource(
+            platform=target_platform,
+            chat_id=str(chat_id),
+            chat_type=chat_type,
+            user_id=str(user_id) if user_id else "",
+        )
+        session_key = build_session_key(source)
+
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=internal,
+        )
+
+        self._enqueue_fifo(session_key, event, adapter)
+        logger.info(
+            "[inject] Enqueued message to session_key=%s platform=%s len=%d",
+            session_key, platform, len(text),
+        )
+        # Trigger drain if session is idle
+        if session_key not in getattr(adapter, "_active_sessions", {}):
+            pending = _dequeue_pending_event(adapter, session_key)
+            if pending:
+                asyncio.create_task(
+                    adapter._process_message_background(pending, session_key)
+                )
+                logger.info(
+                    "[inject] Triggered background processing for idle session %s",
+                    session_key,
+                )
+        return True
+
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
     # order, with no merging.  The adapter's _pending_messages dict is a
