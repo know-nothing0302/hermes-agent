@@ -142,8 +142,6 @@ Within each source, Hermes also recognizes sub-category directories that route p
 
 User plugins at `~/.hermes/plugins/model-providers/<name>/` and `~/.hermes/plugins/memory/<name>/` override bundled plugins of the same name — last-writer-wins in `register_provider()` / `register_memory_provider()`. Drop a directory in, and it replaces the built-in without any repo edits.
 
-Sub-category plugins surface in `hermes plugins list` and the interactive `hermes plugins` UI under their **path-derived key** — e.g. `observability/langfuse`, `image_gen/openai`, `platforms/teams`. That key (not the bare manifest `name:`) is the value you pass to `hermes plugins enable …` / `disable …` and the string to add under `plugins.enabled` in `config.yaml`.
-
 ## Plugins are opt-in (with a few exceptions)
 
 **General plugins and user-installed backends are disabled by default** — discovery finds them (so they show up in `hermes plugins` and `/plugins`), but nothing with hooks or tools loads until you add the plugin's name to `plugins.enabled` in `~/.hermes/config.yaml`. This stops third-party code from running without your explicit consent.
@@ -235,7 +233,7 @@ The table above shows the four plugin categories, but within "General plugins" t
 | An **image-generation backend** (DALL·E, SDXL, …) | Backend plugin — `ctx.register_image_gen_provider()` | [Image Generation Provider Plugins](/developer-guide/image-gen-provider-plugin) |
 | A **video-generation backend** (Veo, Kling, Pixverse, Grok-Imagine, Runway, …) | Backend plugin — `ctx.register_video_gen_provider()` | [Video Generation Provider Plugins](/developer-guide/video-gen-provider-plugin) |
 | A **TTS backend** (any CLI — Piper, VoxCPM, Kokoro, xtts, voice-cloning scripts, …) | Config-driven (recommended) — declare under `tts.providers.<name>` with `type: command` in `config.yaml`. OR Python backend plugin — `ctx.register_tts_provider()` for Python-SDK / streaming engines that need more than a shell template. | [TTS Setup](/user-guide/features/tts#custom-command-providers) · [Python plugin guide](/user-guide/features/tts#python-plugin-providers) |
-| An **STT backend** (custom whisper binary, local ASR CLI) | Config-driven — set `HERMES_LOCAL_STT_COMMAND` env var to a shell template | [Voice Message Transcription (STT)](/user-guide/features/tts#voice-message-transcription-stt) |
+| An **STT backend** (any CLI — whisper.cpp, custom whisper binary, local ASR CLI) | Config-driven (recommended) — declare under `stt.providers.<name>` with `type: command` in `config.yaml`, or set `HERMES_LOCAL_STT_COMMAND` for the legacy single-command escape hatch. OR Python backend plugin — `ctx.register_transcription_provider()` for Python-SDK engines (OpenRouter, SenseAudio, Gemini-STT, etc.). | [STT Setup](/user-guide/features/tts#stt-custom-command-providers) · [Python plugin guide](/user-guide/features/tts#python-plugin-providers-stt) |
 | **External tools via MCP** (filesystem, GitHub, Linear, Notion, any MCP server) | Config-driven — declare `mcp_servers.<name>` with `command:` / `url:` in `config.yaml`. Hermes auto-discovers the server's tools and registers them alongside built-ins. | [MCP](/user-guide/features/mcp) |
 | **Additional skill sources** (custom GitHub repos, private skill indexes) | CLI — `hermes skills tap add <repo>` | [Skills Hub](/user-guide/features/skills#skills-hub) · [Publishing a custom tap](/user-guide/features/skills#publishing-a-custom-skill-tap) |
 | **Gateway event hooks** (fire on `gateway:startup`, `session:start`, `agent:end`, `command:*`) | Drop `HOOK.yaml` + `handler.py` into `~/.hermes/hooks/<name>/` | [Event Hooks](/user-guide/features/hooks#gateway-event-hooks) |
@@ -265,19 +263,16 @@ Declarative plugins are symlinked with a `nix-managed-` prefix — they coexist 
 ## Managing plugins
 
 ```bash
-hermes plugins                                       # unified interactive UI
-hermes plugins list                                  # table: enabled / disabled / not enabled
-hermes plugins install user/repo                     # install from Git, then prompt Enable? [y/N]
-hermes plugins install user/repo --enable            # install AND enable (no prompt)
-hermes plugins install user/repo --no-enable         # install but leave disabled (no prompt)
-hermes plugins update my-plugin                      # pull latest
-hermes plugins remove my-plugin                      # uninstall
-hermes plugins enable my-plugin                      # add to allow-list (flat plugin)
-hermes plugins enable observability/langfuse         # add to allow-list (sub-category plugin)
-hermes plugins disable my-plugin                     # remove from allow-list + add to disabled
+hermes plugins                               # unified interactive UI
+hermes plugins list                          # table: enabled / disabled / not enabled
+hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
+hermes plugins install user/repo --enable    # install AND enable (no prompt)
+hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
+hermes plugins update my-plugin              # pull latest
+hermes plugins remove my-plugin              # uninstall
+hermes plugins enable my-plugin              # add to allow-list
+hermes plugins disable my-plugin             # remove from allow-list + add to disabled
 ```
-
-For plugins under a sub-category directory (e.g. `plugins/observability/langfuse/`, `plugins/image_gen/openai/`), use the full `<category>/<plugin>` key — that's exactly what `hermes plugins list` shows in the **Name** column.
 
 ### Interactive UI
 
@@ -291,7 +286,6 @@ Plugins
  → [✓] my-tool-plugin — Custom search tool
    [ ] webhook-notifier — Event hooks
    [ ] disk-cleanup — Auto-cleanup of ephemeral files [bundled]
-   [ ] observability/langfuse — Trace turns / LLM calls / tools to Langfuse [bundled]
 
   Provider Plugins
      Memory Provider          ▸ honcho
