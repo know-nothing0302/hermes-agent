@@ -1513,15 +1513,18 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "cc_task_complete":
         tid = evt.get("task_id", "?")
-        result = evt.get("result", "?")
-        output = evt.get("output", "")
+        result = evt.get("result") or evt.get("status", "?")
+        output = evt.get("summary", evt.get("output", ""))
+        suggest = evt.get("suggest", "")
         src = evt.get("source", "unknown")
-        return (
+        msg = (
             f"[CC-NOTIFICATION] Task {tid} completed ({result}).\n"
             f"Source: {src}\n"
-            f"Please review the CC output and decide next steps.\n"
-            f"Output:\n{output}"
+            f"Summary: {output}"
         )
+        if suggest:
+            msg += f"\nSuggest: {suggest}"
+        return msg
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"

@@ -407,14 +407,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     session_id = getattr(agent, "session_id", None) or session_key
     _notify_session_boundary("on_session_finalize", session_id)
 
-    # Clean up per-session CC notify socket
-    if session_key:
-        _sock_path = f"/tmp/hermes-tui-{session_key}.sock"
-        try:
-            os.unlink(_sock_path)
-        except OSError:
-            pass
-
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
@@ -981,7 +973,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _start_cc_notify_socket(key, current["cc_queue"])
+            _start_daemon_client(key, current["cc_queue"])
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent, current)
@@ -3269,7 +3261,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _start_cc_notify_socket(key, _sessions[sid]["cc_queue"])
+    _start_daemon_client(key, _sessions[sid]["cc_queue"])
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
 
@@ -5682,100 +5674,197 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 
 
-def _start_cc_notify_socket(session_key: str, cc_queue: queue.Queue) -> None:
-    """Per-session Unix domain socket listener for CC task completion notifications.
+def _start_daemon_client(session_key: str, cc_queue: queue.Queue) -> None:
+    """Connect to hermes-notify-daemon and relay CC notifications to cc_queue.
 
-    Each TUI session gets its own socket at /tmp/hermes-tui-{session_key}.sock
-    so CC completion notifications are delivered to the correct session without
-    source-routing re-queue.
+    Replaces the old per-session Unix socket listener. The daemon listens on a
+    fixed TCP port (127.0.0.1:18644). The gateway registers its session_key so
+    the daemon can route buffered notifications back when the TUI reconnects.
 
-    Runs as a daemon thread. External processes (e.g. cc-dev completion
-    scripts) connect, send a one-line JSON message, and disconnect.
-    Parsed events are pushed into the per-session cc_queue.
+    Runs as a daemon thread with auto-reconnect.
     """
-    sock_path = f"/tmp/hermes-tui-{session_key}.sock"
+    DAEMON_HOST = "127.0.0.1"
+    DAEMON_PORT = 18644
+    RECONNECT_DELAY_S = 5.0
+    RECV_SIZE = 65536
 
-    def _listen() -> None:
-        # Clean up stale socket file
-        try:
-            os.unlink(sock_path)
-        except OSError:
-            pass
-
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.bind(sock_path)
-            sock.listen(5)
-        except Exception as exc:
-            print(
-                f"[tui_gateway] cc notify socket bind failed for {sock_path}: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            return
-
+    # Read shared secret from config (one-time, at thread start)
+    _daemon_secret = ""
+    try:
+        cfg = _load_cfg()
+        _daemon_secret = (cfg.get("cc_notify") or {}).get("secret", "")
+    except Exception:
+        pass
+    if not _daemon_secret:
         print(
-            f"[tui_gateway] cc notify socket listening on {sock_path}",
+            "[tui_gateway] WARNING — cc_notify.secret not configured, "
+            "daemon registration will fail",
             file=sys.stderr,
         )
 
-        while True:
+    # ── Session migration state ──────────────────────────────────────
+    STATE_FILE = "/var/run/hermes/tui-last-session-key"
+    _previous_key = ""
+    try:
+        with open(STATE_FILE, "r") as f:
+            _previous_key = f.read().strip()
+        if _previous_key == session_key:
+            _previous_key = ""  # same key → nothing to migrate
+    except (OSError, FileNotFoundError):
+        pass
+
+    def _refresh_cc_notify_env() -> None:
+        """Update stale .cc-notify-env files in CC task directories.
+
+        After a TUI reconnect (new session_key), cc-notify.sh would pick up
+        the old key from the env file and route notifications to a dead TUI
+        session.  This walks /opt/cc-*/ and replaces any old session_key
+        with the current one.
+        """
+        import glob as _glob
+        _count = 0
+        _updated = 0
+        for _envf in _glob.glob("/opt/cc-*/.cc-notify-env"):
+            _count += 1
             try:
-                conn, _ = sock.accept()
-            except Exception:
-                break
-
-            try:
-                with conn:
-                    data = conn.recv(4096)
-                    if not data:
-                        continue
-                    try:
-                        msg = json.loads(data.decode("utf-8").strip())
-                    except json.JSONDecodeError as exc:
-                        print(
-                            f"[tui_gateway] cc notify socket bad JSON: {exc}",
-                            file=sys.stderr,
-                        )
-                        continue
-
-                    if msg.get("type") == "wecom_message":
-                        # 复用 cc_task_complete 通路让 poller 走 re-queue
-                        msg["type"] = "cc_task_complete"
-                        msg["task_id"] = f"wecom-{msg.get('user','?')}-{int(msg.get('ts', time.time()))}"
-                        msg["status"] = "done"
-                        msg["source"] = "wecom"
-                        msg["summary"] = msg.get("text", "")[:200]
-                        msg["wecom_user"] = msg.get("user", "")
-                        msg["wecom_chat_id"] = msg.get("chat_id", "")
-
-                    if msg.get("type") != "cc_task_complete":
-                        print(
-                            f"[tui_gateway] cc notify socket unknown type: "
-                            f"{msg.get('type', '?')}",
-                            file=sys.stderr,
-                        )
-                        continue
-
-                    cc_queue.put(msg)
-                    # After successful processing, send ack back to CC
-                    try:
-                        conn.sendall(b'{"status":"ack"}\n')
-                    except Exception:
-                        pass  # Best-effort; CC notification was already received
+                with open(_envf, "r") as _f:
+                    _content = _f.read()
+                _old = ""
+                for _line in _content.split("\n"):
+                    if _line.startswith("HERMES_SESSION_KEY="):
+                        _old = _line.split("=", 1)[1].strip()
+                        break
+                if _old and _old != session_key:
+                    _new = _content.replace(
+                        f"HERMES_SESSION_KEY={_old}",
+                        f"HERMES_SESSION_KEY={session_key}",
+                    )
+                    with open(_envf, "w") as _f:
+                        _f.write(_new)
+                    _updated += 1
                     print(
-                        f"[tui_gateway] cc notify socket queued task "
-                        f"{msg.get('task_id', '?')} → {sock_path}",
+                        f"[tui_gateway] refreshed .cc-notify-env "
+                        f"{os.path.basename(os.path.dirname(_envf))}: "
+                        f"{_old[:15]}... → {session_key[:15]}...",
                         file=sys.stderr,
                     )
+            except OSError:
+                pass
+        if _updated:
+            print(
+                f"[tui_gateway] refreshed {_updated}/{_count} stale "
+                f".cc-notify-env files",
+                file=sys.stderr,
+            )
+
+    def _connect() -> socket.socket | None:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((DAEMON_HOST, DAEMON_PORT))
+            return sock
+        except Exception as exc:
+            print(
+                f"[tui_gateway] daemon connect failed ({DAEMON_HOST}:{DAEMON_PORT}): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+    def _run() -> None:
+        nonlocal _previous_key
+        while True:
+            sock = _connect()
+            if sock is None:
+                time.sleep(RECONNECT_DELAY_S)
+                continue
+
+            try:
+                # Register with daemon (with shared secret for auth).
+                # Include previous_key so the daemon can forward buffered
+                # notifications from the old TUI session to this new one.
+                _reg_payload = {
+                    "type": "register",
+                    "session_key": session_key,
+                    "secret": _daemon_secret,
+                }
+                if _previous_key and _previous_key != session_key:
+                    _reg_payload["previous_key"] = _previous_key
+                reg = json.dumps(_reg_payload)
+                sock.sendall((reg + "\n").encode("utf-8"))
+
+                # Read ack from daemon
+                sock.settimeout(5.0)
+                try:
+                    ack_data = sock.recv(RECV_SIZE)
+                    if ack_data:
+                        ack = json.loads(ack_data.decode("utf-8").strip())
+                        if ack.get("type") == "registered":
+                            print(
+                                f"[tui_gateway] daemon registered "
+                                f"session_key={session_key}",
+                                file=sys.stderr,
+                            )
+                            # Persist current key for next‑restart migration
+                            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+                            try:
+                                with open(STATE_FILE, "w") as _f:
+                                    _f.write(session_key)
+                            except OSError:
+                                pass
+                            _previous_key = ""  # migration complete
+
+                            # Refresh stale .cc-notify-env files in CC dirs
+                            _refresh_cc_notify_env()
+                except socket.timeout:
+                    pass
+
+                # Read forwarded notifications
+                sock.settimeout(60.0)
+                buf = b""
+                while True:
+                    try:
+                        data = sock.recv(RECV_SIZE)
+                        if not data:
+                            break
+                        buf += data
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            if not line.strip():
+                                continue
+                            try:
+                                msg = json.loads(line.decode("utf-8").strip())
+                            except json.JSONDecodeError:
+                                continue
+                            if msg.get("type") == "cc_task_complete":
+                                cc_queue.put(msg)
+                                print(
+                                    f"[tui_gateway] daemon forwarded task "
+                                    f"{msg.get('task_id', '?')} → session_key={session_key}",
+                                    file=sys.stderr,
+                                )
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
             except Exception as exc:
                 print(
-                    f"[tui_gateway] cc notify socket recv error: "
-                    f"{type(exc).__name__}: {exc}",
+                    f"[tui_gateway] daemon client error: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
-    t = threading.Thread(target=_listen, daemon=True)
+            print(
+                f"[tui_gateway] daemon disconnected, reconnecting in {RECONNECT_DELAY_S}s...",
+                file=sys.stderr,
+            )
+            time.sleep(RECONNECT_DELAY_S)
+
+    t = threading.Thread(target=_run, daemon=True)
     t.start()
 
 
