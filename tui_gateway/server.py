@@ -7350,6 +7350,36 @@ def _notification_poller_loop(
                 _wecom_reply_chat_id = evt.get("wecom_chat_id", "") or evt.get("chat_id", "")
                 if _wecom_reply_chat_id:
                     session["_wecom_reply_chat_id"] = _wecom_reply_chat_id
+
+            # Inject CC notification into the LLM session (mirrors regular completion path)
+            if _text:
+                _dedup_key = _notification_event_dedup_key(evt)
+                if _dedup_key not in _emitted:
+                    _emitted.add(_dedup_key)
+
+                    # Re-queue if session is busy; retry on next poll cycle
+                    with session["history_lock"]:
+                        if session.get("running"):
+                            if cc_queue is not None:
+                                cc_queue.put(evt)
+                            continue
+                        session["running"] = True
+
+                    rid = f"__notif__{int(time.time() * 1000)}"
+                    _write_debug_log(event="poller_turn_start", session_key=sid,
+                                     running=session.get("running"),
+                                     text_preview=str(_text)[:200])
+                    try:
+                        _emit("message.start", sid)
+                        _run_prompt_submit(rid, sid, session, _text)
+                    except Exception as exc:
+                        print(
+                            f"[tui_gateway] CC notification dispatch failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                        with session["history_lock"]:
+                            session["running"] = False
             continue
 
         # --- Regular completion event (from global queue) ---
