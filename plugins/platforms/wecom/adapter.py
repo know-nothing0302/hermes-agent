@@ -203,6 +203,11 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+        # Explicit stop signal for the background loops. Do NOT use
+        # self._running for this: _mark_disconnected() flips _running to
+        # False on every connection drop, and a failed reconnect would
+        # leave it False — silently killing the reconnect loop (2026-07-14).
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -234,6 +239,7 @@ class WeComAdapter(BasePlatformAdapter):
             )
             await self._open_connection()
             self._mark_connected()
+            self._stopping = False
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
@@ -250,6 +256,7 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from WeCom."""
+        self._stopping = True
         self._running = False
         self._mark_disconnected()
 
@@ -280,14 +287,27 @@ class WeComAdapter(BasePlatformAdapter):
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
-        """Close the live websocket/session, if any."""
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+        """Close the live websocket/session, if any.
 
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        Must never raise and must always drop the references: close() on a
+        half-closed transport can itself fail ("Cannot write to closing
+        transport"), and a leftover zombie ws makes _read_events() block
+        forever on receive(), killing the reconnect loop.
+        """
+        ws, self._ws = self._ws, None
+        session, self._session = self._session, None
+
+        if ws is not None and not ws.closed:
+            try:
+                await ws.close()
+            except Exception as exc:
+                logger.debug("[%s] ws.close() failed during cleanup: %s", self.name, exc)
+
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception as exc:
+                logger.debug("[%s] session.close() failed during cleanup: %s", self.name, exc)
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
@@ -345,14 +365,14 @@ class WeComAdapter(BasePlatformAdapter):
     async def _listen_loop(self) -> None:
         """Read websocket events forever, reconnecting on errors."""
         backoff_idx = 0
-        while self._running:
+        while not self._stopping:
             try:
                 await self._read_events()
                 backoff_idx = 0
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                if not self._running:
+                if self._stopping:
                     return
                 ts = time.time()
                 self._mark_disconnected()
@@ -373,13 +393,16 @@ class WeComAdapter(BasePlatformAdapter):
                     _write_debug_log(event="wecom_ws_reconnect_verified", ts=time.time())
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect attempt %d failed: %s", self.name, attempt, reconnect_exc)
+                    # Drop any half-open state so the next _read_events()
+                    # fails fast instead of hanging on a dead socket.
+                    await self._cleanup_ws()
 
     async def _read_events(self) -> None:
         """Read websocket frames until the connection closes."""
         if not self._ws:
             raise RuntimeError("WebSocket not connected")
 
-        while self._running and self._ws and not self._ws.closed:
+        while not self._stopping and self._ws and not self._ws.closed:
             msg = await self._ws.receive()
 
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -392,7 +415,7 @@ class WeComAdapter(BasePlatformAdapter):
     async def _heartbeat_loop(self) -> None:
         """Send lightweight application-level pings."""
         try:
-            while self._running:
+            while not self._stopping:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 if not self._ws or self._ws.closed:
                     continue

@@ -953,3 +953,74 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is None, (
             "active task must pop the event after processing"
         )
+
+
+class TestWeComCleanupResilience:
+    """Regression tests for the 2026-07-14 reconnect-loop hang.
+
+    ws.close() raised ("Cannot write to closing transport") inside
+    _cleanup_ws, leaving the zombie ws in place; the next _read_events()
+    then blocked forever on receive() and the adapter never reconnected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cleanup_ws_swallows_close_errors_and_drops_refs(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+
+        ws = MagicMock()
+        ws.closed = False
+        ws.close = AsyncMock(side_effect=ConnectionResetError("Cannot write to closing transport"))
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock(side_effect=RuntimeError("session broken"))
+        adapter._ws = ws
+        adapter._session = session
+
+        await adapter._cleanup_ws()
+
+        assert adapter._ws is None, "zombie ws must be dropped even when close() raises"
+        assert adapter._session is None, "session ref must be dropped even when close() raises"
+        ws.close.assert_awaited_once()
+        session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_cleans_up_after_failed_reconnect(self, monkeypatch):
+        from plugins.platforms.wecom import adapter as wecom_adapter
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        monkeypatch.setattr(wecom_adapter, "RECONNECT_BACKOFF", [0])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._stopping = False
+
+        zombie = MagicMock()
+        zombie.closed = False
+        zombie.close = AsyncMock(side_effect=ConnectionResetError("Cannot write to closing transport"))
+        adapter._ws = zombie
+
+        calls = {"read": 0, "open": 0}
+
+        async def fake_read_events():
+            calls["read"] += 1
+            if calls["read"] >= 3:
+                adapter._stopping = True
+                return
+            raise RuntimeError("WeCom websocket closed")
+
+        async def fake_open_connection():
+            calls["open"] += 1
+            # First reconnect fails the way the incident did.
+            if calls["open"] == 1:
+                await adapter._cleanup_ws()
+                raise ConnectionResetError("Cannot write to closing transport")
+
+        adapter._read_events = fake_read_events
+        adapter._open_connection = fake_open_connection
+
+        await asyncio.wait_for(adapter._listen_loop(), timeout=5)
+
+        assert adapter._ws is None, "failed reconnect must not leave a zombie ws behind"
+        assert calls["open"] >= 2, "loop must keep retrying after a failed reconnect"
