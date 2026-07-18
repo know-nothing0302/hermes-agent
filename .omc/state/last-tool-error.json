@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"grep -oE '^(GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT)=' /opt/hermes/.env /opt/hermes/hermes-agent/.env 2>/dev/null; ls ~/.config/gh 2>/dev/null\",\"description\":\"Check for GitHub token availability ...",
+  "error": "Exit code 2",
+  "timestamp": "2026-07-16T08:12:11.090Z",
+  "retry_count": 1
+}
